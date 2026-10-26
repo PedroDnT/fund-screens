@@ -72,3 +72,58 @@ class TestPortfolioReconciliation:
         })
         result = analyzer.analyze(cda, informe)
         assert result.empty
+
+
+class TestLiabilitiesAreNetted:
+    """CDA publishes liabilities as positive numbers; the analyzer must subtract them."""
+
+    @staticmethod
+    def _informe(pl):
+        return pd.DataFrame({
+            "CNPJ_FUNDO": ["fund1"], "DT_COMPTC": ["2026-06-30"], "VL_PATRIM_LIQ": [pl],
+        })
+
+    def test_liabilities_are_netted(self, analyzer):
+        cda = pd.DataFrame({
+            "CNPJ_FUNDO": ["fund1"] * 3,
+            "TP_APLIC": [
+                "Cotas de Fundos",
+                "Valores a pagar",
+                "Obrigações por ações e outros TVM recebidos em empréstimo",
+            ],
+            # assets 1.5M, liabilities 0.3M + 0.2M -> net 1.0M == PL
+            "VL_MERCADO": [1_500_000, 300_000, 200_000],
+        })
+        assert analyzer.analyze(cda, self._informe(1_000_000)).empty
+
+    def test_liability_match_ignores_case_and_padding(self, analyzer):
+        cda = pd.DataFrame({
+            "CNPJ_FUNDO": ["fund1"] * 2,
+            "TP_APLIC": ["Cotas de Fundos", "  DIFERENCIAL DE SWAP A PAGAR "],
+            "VL_MERCADO": [1_200_000, 200_000],
+        })
+        assert analyzer.analyze(cda, self._informe(1_000_000)).empty
+
+    def test_without_tp_aplic_the_plain_sum_is_used(self, analyzer):
+        # Same amounts with no TP_APLIC column: 2.0M vs 1.0M PL is a 100% gap.
+        cda = pd.DataFrame({"CNPJ_FUNDO": ["fund1"] * 3, "VL_MERCADO": [1_500_000, 300_000, 200_000]})
+        gaps = analyzer.analyze(cda, self._informe(1_000_000))
+        assert gaps.iloc[0]["gap_pct"] == 100.0
+
+    def test_asset_lines_are_not_negated(self, analyzer):
+        # "Valores a receber" is an asset; netting it would turn 1.0M into 0.6M.
+        cda = pd.DataFrame({
+            "CNPJ_FUNDO": ["fund1"] * 2,
+            "TP_APLIC": ["Cotas de Fundos", "Valores a receber"],
+            "VL_MERCADO": [800_000, 200_000],
+        })
+        assert analyzer.analyze(cda, self._informe(1_000_000)).empty
+
+    def test_gap_that_survives_netting_is_still_flagged(self, analyzer):
+        cda = pd.DataFrame({
+            "CNPJ_FUNDO": ["fund1"] * 2,
+            "TP_APLIC": ["Cotas de Fundos", "Valores a pagar"],
+            "VL_MERCADO": [1_500_000, 100_000],  # net 1.4M vs PL 1.0M
+        })
+        gaps = analyzer.analyze(cda, self._informe(1_000_000))
+        assert gaps.iloc[0]["gap_pct"] == 40.0

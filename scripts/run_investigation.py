@@ -712,8 +712,15 @@ def _read_informe_any(path: Path, *, processor: DataProcessor) -> pd.DataFrame:
         files = sorted(path.glob("inf_diario_fi_*.csv"))
         if not files:
             return pd.DataFrame()
-        dfs = [processor.read_informe_diario(p) for p in files[:24]]  # safety cap
-        return pd.concat([df for df in dfs if not df.empty], ignore_index=True) if dfs else pd.DataFrame()
+        # Read the months raw and fold subclasses once over the whole window: the
+        # dominant subclass (whose quota the class follows) must be the same in
+        # every month, or the quota would step at each month boundary.
+        dfs = [processor.read_informe_diario(p, consolidate_subclasses=False)
+               for p in files[:24]]  # safety cap
+        dfs = [df for df in dfs if not df.empty]
+        if not dfs:
+            return pd.DataFrame()
+        return processor.consolidate_subclasses(pd.concat(dfs, ignore_index=True))
     # Heuristic: processed files are saved with ';'
     if path.name.endswith("_processed.csv"):
         return pd.read_csv(path, sep=";", parse_dates=["DT_COMPTC"])

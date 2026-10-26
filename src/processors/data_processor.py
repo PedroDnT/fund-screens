@@ -166,9 +166,16 @@ class DataProcessor:
 
     def read_informe_diario(self, file_path: Path,
                            encoding: str = 'latin1',
-                           sep: str = ';') -> pd.DataFrame:
-        """Lê arquivo de Informe Diário"""
-        return self._read_csv_generic(
+                           sep: str = ';',
+                           consolidate_subclasses: bool = True) -> pd.DataFrame:
+        """Lê arquivo de Informe Diário.
+
+        Since RCVM 175 the informe has one row per *subclass* per day for a class
+        that has subclasses. By default those rows are folded into one row per
+        class per day (``consolidate_subclasses``). Pass False for the raw rows,
+        e.g. to read several monthly files and consolidate once after concat.
+        """
+        df = self._read_csv_generic(
             file_path=file_path,
             file_type="Informe Diario",
             encoding=encoding,
@@ -177,6 +184,93 @@ class DataProcessor:
             cnpj_cols=['CNPJ_FUNDO'],
             numeric_cols=['VL_TOTAL', 'VL_QUOTA', 'VL_PATRIM_LIQ', 'CAPTC_DIA', 'RESG_DIA', 'NR_COTST']
         )
+        return self.consolidate_subclasses(df) if consolidate_subclasses else df
+
+    # Informe columns that add up across the subclasses of one class. Checked on
+    # the June 2026 informe against the class-level PL in CDA's PL file: for the
+    # classes with several subclasses, the sum of the subclasses' VL_TOTAL or of
+    # their VL_PATRIM_LIQ is within 0.01% of it for 89% of them (the largest
+    # subclass alone, for 4%). VL_QUOTA is absent on purpose: it is a price.
+    _SUBCLASS_ADDITIVE_COLUMNS = ('VL_TOTAL', 'VL_PATRIM_LIQ', 'CAPTC_DIA', 'RESG_DIA', 'NR_COTST')
+
+    def consolidate_subclasses(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Give each class ONE informe row per day instead of one per subclass.
+
+        A class with subclasses reports a row per subclass per day under the
+        class CNPJ, each with its own quota (Kinea Absoluto: 2.05, 2.05, 2.05,
+        1.01), PL and holder count. Left as is, every analyzer that groups by
+        ``CNPJ_FUNDO`` reads those series interleaved: quota "returns" are the
+        gaps between subclasses (31.6% exceed 5% in the June 2026 informe on the
+        221 classes concerned), PL and holders saw-tooth, and every Benford
+        sample repeats once per subclass.
+
+        On a class-day with several rows this returns one row where
+
+        - VL_TOTAL, VL_PATRIM_LIQ, CAPTC_DIA, RESG_DIA and NR_COTST are the SUM
+          over the subclasses (DERIVED). NR_COTST is then an upper bound on
+          distinct holders (a holder of two subclasses counts twice). The flows
+          include transfers between subclasses, which net out in FLUXO_LIQ_DIA.
+        - VL_QUOTA is the quota the DOMINANT subclass reported that day (REPORTED,
+          not derived). Dominant = the class's subclass with the largest PL
+          summed over the rows given, so one series is followed for the whole
+          window. It is NaN on a day that subclass did not report; another
+          subclass's quota would be a price jump that never happened.
+        - N_SUBCLASS_ROWS counts the rows folded; ID_SUBCLASSE_QUOTA names the
+          subclass the quota comes from; ID_SUBCLASSE is blank.
+
+        Every other row passes through untouched, in its place (N_SUBCLASS_ROWS
+        = 1). CVM publishes no class-level row beside subclass rows (0 cases in
+        June 2026); should one appear on a day, it alone is kept for that day, so
+        nothing is counted twice.
+        """
+        key = ['CNPJ_FUNDO', 'DT_COMPTC']
+        if df.empty or not {*key, 'ID_SUBCLASSE', 'VL_QUOTA', 'VL_PATRIM_LIQ'} <= set(df.columns):
+            return df
+
+        df = df.reset_index(drop=True)
+        df['ID_SUBCLASSE'] = df['ID_SUBCLASSE'].astype('string').str.strip().replace('', pd.NA)
+        class_level = df['ID_SUBCLASSE'].isna()
+        on_class_day = class_level.groupby([df[k] for k in key], dropna=False).transform('any')
+        if (on_class_day & ~class_level).any():
+            logger.warning(
+                "Informe: dropped %d subclass row(s) on days when the class also reports "
+                "a class-level row", int((on_class_day & ~class_level).sum()))
+            df = df[~(on_class_day & ~class_level)]
+
+        # N_SUBCLASS_ROWS and ID_SUBCLASSE_QUOTA are the provenance of the folded rows.
+        df = df.assign(N_SUBCLASS_ROWS=1, ID_SUBCLASSE_QUOTA=df['ID_SUBCLASSE'])
+        dated = df[key].notna().all(axis=1)
+        # Every row of a class that ever has several rows on one day is folded,
+        # also its single-row days, so that one quota series runs through the window.
+        several = df.duplicated(key, keep=False) & dated & df['ID_SUBCLASSE'].notna()
+        scope = df['CNPJ_FUNDO'].isin(df.loc[several, 'CNPJ_FUNDO']) & dated
+        if not scope.any():
+            return df
+
+        rows = df[scope]
+        additive = [c for c in self._SUBCLASS_ADDITIVE_COLUMNS if c in rows.columns]
+        by_day = rows.groupby(key, sort=False)
+        folded = by_day[additive].sum(min_count=1)
+        folded['N_SUBCLASS_ROWS'] = by_day.size()
+        folded['_row'] = rows.assign(_row=rows.index).groupby(key, sort=False)['_row'].min()
+        for col in rows.columns.difference([*key, *additive, 'ID_SUBCLASSE', 'ID_SUBCLASSE_QUOTA',
+                                            'N_SUBCLASS_ROWS', 'VL_QUOTA']):
+            folded[col] = by_day[col].first()
+
+        # Follow one subclass per class: the one holding the most PL in these rows.
+        pl = rows.groupby(['CNPJ_FUNDO', 'ID_SUBCLASSE'], as_index=False)['VL_PATRIM_LIQ'].sum()
+        dominant = (pl.sort_values(['VL_PATRIM_LIQ', 'ID_SUBCLASSE'])
+                    .drop_duplicates('CNPJ_FUNDO', keep='last')
+                    .rename(columns={'ID_SUBCLASSE': 'DOMINANT'})[['CNPJ_FUNDO', 'DOMINANT']])
+        rows = rows.merge(dominant, on='CNPJ_FUNDO', how='left')
+        # A class-level row (no subclass id) reports the class's own quota.
+        source = rows[(rows['ID_SUBCLASSE'] == rows['DOMINANT']) | rows['ID_SUBCLASSE'].isna()]
+        source = source.drop_duplicates(key).set_index(key)[['VL_QUOTA', 'ID_SUBCLASSE_QUOTA']]
+        folded = folded.join(source)
+        folded = folded.reset_index().set_index('_row')
+
+        out = pd.concat([df[~scope], folded]).sort_index(kind='stable').reset_index(drop=True)
+        return out[list(df.columns)]
 
     # Cada bloco do CDA identifica o ativo por uma coluna diferente, conforme a
     # classe: BLC_4 e fie trazem CD_ATIVO, BLC_1 titulos publicos (CD_SELIC),

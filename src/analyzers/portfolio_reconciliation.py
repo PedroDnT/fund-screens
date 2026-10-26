@@ -2,9 +2,16 @@
 Portfolio Reconciliation Analyzer
 
 Cross-validates CDA portfolio composition against Informe Diario PL:
-- Static gap: sum(VL_MERCADO) from CDA vs VL_PATRIM_LIQ from Informe
+- Static gap: net CDA positions (assets minus liabilities) vs VL_PATRIM_LIQ from Informe
 - Dynamic reconciliation: period-over-period change consistency
 - Hidden positions: large PL with small/no CDA positions
+
+The CDA is a balance sheet, not a list of assets. CVM files liabilities in the
+same blocks as assets and publishes their value as a POSITIVE number ("Valores a
+pagar", "Outras operacoes passivas e exigibilidades", ...). Summing the column as
+published adds them to the assets. Netting them reproduces the fund's PL for the
+large majority of funds (June 2026: within 1e-6 of PL for 88% of 25,673 funds,
+against 0.6% unnetted), so a gap that survives the netting is a real inconsistency.
 """
 
 import logging
@@ -16,6 +23,28 @@ from config.constants import RECON_GAP_WARNING, RECON_GAP_CRITICAL
 from .base import BaseAnalyzer
 
 logger = logging.getLogger(__name__)
+
+#: CDA TP_APLIC values that are liabilities. CVM publishes their value as a
+#: positive number; the analyzer subtracts them. Compared case-folded.
+LIABILITY_APLIC = frozenset(
+    {
+        "valores a pagar",
+        "outras operações passivas e exigibilidades",
+        "obrigações por ações e outros tvm recebidos em empréstimo",
+        "obrigações por compra a termo a pagar",
+        "obrigações por venda a termo a entregar",
+        "diferencial de swap a pagar",
+    }
+)
+
+
+def _signed_value(cda_df: pd.DataFrame) -> pd.Series:
+    """VL_MERCADO with liabilities negated. Unsigned when TP_APLIC is absent."""
+    value = pd.to_numeric(cda_df["VL_MERCADO"], errors="coerce").astype(float)
+    if "TP_APLIC" not in cda_df.columns:
+        return value
+    key = cda_df["TP_APLIC"].astype("string").str.strip().str.casefold()
+    return value.where(~key.isin(LIABILITY_APLIC).fillna(False), -value)
 
 
 class PortfolioReconciliationAnalyzer(BaseAnalyzer):
@@ -50,10 +79,11 @@ class PortfolioReconciliationAnalyzer(BaseAnalyzer):
         findings: list[dict[str, Any]] = []
 
         cda_totals = (
-            cda_df.groupby("CNPJ_FUNDO")["VL_MERCADO"]
+            cda_df.assign(_signed=_signed_value(cda_df))
+            .groupby("CNPJ_FUNDO")["_signed"]
             .sum()
             .reset_index()
-            .rename(columns={"VL_MERCADO": "cda_total"})
+            .rename(columns={"_signed": "cda_total"})
         )
 
         latest_informe = (
