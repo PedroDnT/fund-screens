@@ -1,4 +1,4 @@
-# funds_fraud_alert
+# funds_screens
 
 Statistical fraud detection for Brazilian investment funds, built on public CVM
 filings.
