@@ -311,8 +311,8 @@ SIGNAL_REGISTRY: dict[str, SignalDefinition] = {
         finding_id="portfolio_reconciliation_gap",
         title="Portfolio vs PL reconciliation gap",
         plain_language_explanation=(
-            "We detected a significant discrepancy between the sum of portfolio positions (CDA) and the "
-            "reported net asset value (Informe Diario PL). Gaps can indicate hidden positions, "
+            "We detected a significant discrepancy between the net portfolio positions (CDA assets minus "
+            "liabilities) and the reported net asset value (Informe Diario PL). Gaps can indicate hidden positions, "
             "off-book assets, or reporting inconsistencies."
         ),
         evidence_fields=("CNPJ_FUNDO", "DT_COMPTC", "cda_total", "informe_pl", "gap_pct", "signal_type", "severity"),

@@ -61,6 +61,18 @@ the informe is historical, so pairing today's registry with an old month drops
 funds that had not yet registered. A fund filter that matches nothing is
 reported as an error rather than producing an empty report.
 
+**Subclasses are folded.** A class with subclasses reports one informe row per
+subclass per day, each with its own quota, PL and holder count. The reader folds
+them into one row per class per day: PL, flows and holder counts are summed
+(derived), and `VL_QUOTA` is the quota the dominant subclass reported. Read as
+separate rows they interleave into one series, and every detector that groups by
+CNPJ sees jumps that never happened. `read_informe_diario(consolidate_subclasses=False)`
+returns the raw rows.
+
+**The CDA is a balance sheet.** CVM publishes liabilities ("Valores a pagar",
+swap payables, ...) as positive numbers in the same blocks as assets. The
+reconciliation detector subtracts them before comparing with PL.
+
 ## Run an investigation
 
 ```bash
